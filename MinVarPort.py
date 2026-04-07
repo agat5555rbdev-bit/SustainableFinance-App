@@ -22,7 +22,6 @@ DEFAULTS = {
     "lambda_esg": 0.30,
     "gamma": 3.0,
     "num_points": 1001,
-    "firm_frontier_points": 80,
 }
 
 for k, v in DEFAULTS.items():
@@ -36,7 +35,7 @@ def go_to(page_name: str):
 
 
 # =========================================================
-# Finance / ESG functions (2-asset teaching model)
+# Finance / ESG functions
 # =========================================================
 def var_covar(sigmas: np.ndarray, rho: float) -> np.ndarray:
     """2x2 covariance matrix."""
@@ -156,290 +155,142 @@ def format_table(df: pd.DataFrame):
 
 
 # =========================================================
-# Uploaded firm-data loaders
+# Company ESG data functions
 # =========================================================
 @st.cache_data
-def load_firm_universe_data() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def load_company_esg_data() -> pd.DataFrame:
     """
-    Load the uploaded 2024 firm universe and the correlation/covariance matrices.
-
-    Files expected:
-      - CRSP_merged_overlap_only.xlsx
-      - CRSP_correlation_covariance_2010_2024.xlsx
-
-    For consistency with 2024 annual returns, the firm-level optimiser builds an
-    annual covariance matrix as:
-
-        annual_cov = diag(annualised vol 2024) @ correlation_matrix @ diag(annualised vol 2024)
-
-    Only firms with all required information are retained.
+    Load the 2025 ESGCombinedScore company file from repo/local environment.
+    Expected raw columns from your CSV:
+      comname, value, valuescore, year, fieldname, ...
     """
-    merged_candidates = [
-        Path("CRSP_merged_overlap_only.xlsx"),
-        Path("/mnt/CRSP_merged_overlap_only.xlsx"),
-    ]
-    matrix_candidates = [
-        Path("CRSP_correlation_covariance_2010_2024.xlsx"),
-        Path("/mnt/CRSP_correlation_covariance_2010_2024.xlsx"),
+    candidate_paths = [
+        Path("esg_data_2025_esgcombined_only.csv"),
+        Path("/mnt/esg_data_2025_esgcombined_only.csv"),
     ]
 
-    merged_path = next((p for p in merged_candidates if p.exists()), None)
-    matrix_path = next((p for p in matrix_candidates if p.exists()), None)
+    file_path = None
+    for p in candidate_paths:
+        if p.exists():
+            file_path = p
+            break
 
-    if merged_path is None:
+    if file_path is None:
         raise FileNotFoundError(
-            "Could not find 'CRSP_merged_overlap_only.xlsx'. Put it in the same folder as app.py."
-        )
-    if matrix_path is None:
-        raise FileNotFoundError(
-            "Could not find 'CRSP_correlation_covariance_2010_2024.xlsx'. Put it in the same folder as app.py."
+            "Could not find 'esg_data_2025_esgcombined_only.csv'. "
+            "Put it in the same folder as app.py or in a data/ folder."
         )
 
-    merged = pd.read_excel(merged_path, sheet_name="Merged Data")
-    corr = pd.read_excel(matrix_path, sheet_name="Correlation", index_col=0)
-    raw_cov = pd.read_excel(matrix_path, sheet_name="Covariance", index_col=0)
+    raw = pd.read_csv(file_path)
 
-    required_cols = {
-        "ticker",
-        "comname",
-        "valuescore",
-        "value",
-        "return_2024",
-        "annualized_volatility_std_dev",
-    }
-    missing = required_cols - set(merged.columns)
+    required_cols = {"comname", "value", "valuescore", "year", "fieldname"}
+    missing = required_cols - set(raw.columns)
     if missing:
-        raise ValueError(f"Merged file is missing required columns: {sorted(missing)}")
+        raise ValueError(f"CSV is missing required columns: {sorted(missing)}")
 
-    # Keep only tickers that appear in all data sources
-    overlap = sorted(
-        set(merged["ticker"].astype(str))
-        & set(corr.index.astype(str))
-        & set(raw_cov.index.astype(str))
-    )
-    use = merged[merged["ticker"].astype(str).isin(overlap)].copy()
+    df = raw[(raw["year"] == 2025) & (raw["fieldname"] == "ESGCombinedScore")].copy()
 
-    # If any ticker appears multiple times, collapse to one row per ticker.
-    # Numeric columns are averaged; text columns keep the first available value.
-    agg_map = {}
-    for col in use.columns:
-        if col == "ticker":
-            continue
-        if pd.api.types.is_numeric_dtype(use[col]):
-            agg_map[col] = "mean"
-        else:
-            agg_map[col] = "first"
+    keep_cols = ["comname", "value", "valuescore"]
+    if "ticker" in df.columns:
+        keep_cols.append("ticker")
+    if "isin" in df.columns:
+        keep_cols.append("isin")
 
-    firms = use.groupby("ticker", as_index=False).agg(agg_map).copy()
-
-    firms["valuescore"] = pd.to_numeric(firms["valuescore"], errors="coerce")
-    firms["return_2024"] = pd.to_numeric(firms["return_2024"], errors="coerce")
-    firms["annualized_volatility_std_dev"] = pd.to_numeric(
-        firms["annualized_volatility_std_dev"], errors="coerce"
-    )
-
-    firms = firms.dropna(subset=["ticker", "valuescore", "return_2024", "annualized_volatility_std_dev"]).copy()
-    firms = firms[firms["annualized_volatility_std_dev"] > 0].copy()
-
-    tickers = firms["ticker"].astype(str).tolist()
-    corr_sub = corr.loc[tickers, tickers].apply(pd.to_numeric, errors="coerce")
-    cov_sub = raw_cov.loc[tickers, tickers].apply(pd.to_numeric, errors="coerce")
-
-    # Drop any tickers with incomplete matrix rows/columns
-    bad_tickers = set(corr_sub.index[corr_sub.isna().any(axis=1)])
-    bad_tickers |= set(corr_sub.columns[corr_sub.isna().any(axis=0)])
-    bad_tickers |= set(cov_sub.index[cov_sub.isna().any(axis=1)])
-    bad_tickers |= set(cov_sub.columns[cov_sub.isna().any(axis=0)])
-
-    firms = firms[~firms["ticker"].isin(bad_tickers)].copy().sort_values("ticker").reset_index(drop=True)
-    tickers = firms["ticker"].astype(str).tolist()
-    corr_sub = corr.loc[tickers, tickers].apply(pd.to_numeric, errors="coerce")
-
-    # Build an annual covariance matrix consistent with 2024 annual returns
-    vols = firms["annualized_volatility_std_dev"].to_numpy(dtype=float)
-    annual_cov = np.outer(vols, vols) * corr_sub.to_numpy(dtype=float)
-
-    # Numerical clean-up
-    annual_cov = (annual_cov + annual_cov.T) / 2.0
-    np.fill_diagonal(annual_cov, np.maximum(np.diag(annual_cov), 1e-10))
-
-    # Small ridge to stabilise inversion in large universes
-    annual_cov = annual_cov + np.eye(len(firms)) * 1e-8
+    df = df[keep_cols].copy()
 
     rename_map = {
-        "ticker": "Ticker",
         "comname": "Company",
         "value": "ESG Grade",
         "valuescore": "ESG Score",
-        "return_2024": "Expected Return",
-        "annualized_volatility_std_dev": "Annual Volatility",
+        "ticker": "Ticker",
+        "isin": "ISIN",
     }
-    firms = firms.rename(columns=rename_map)
+    df = df.rename(columns=rename_map)
 
-    if "isin" not in firms.columns:
-        firms["isin"] = ""
-    firms = firms.rename(columns={"isin": "ISIN"})
+    df["ESG Score"] = pd.to_numeric(df["ESG Score"], errors="coerce")
+    df = df.dropna(subset=["Company", "ESG Score"]).copy()
 
-    firms["ESG Score (%)"] = firms["ESG Score"] * 100
-    firms["Expected Return (%)"] = firms["Expected Return"] * 100
-    firms["Annual Volatility (%)"] = firms["Annual Volatility"] * 100
+    if "Ticker" not in df.columns:
+        df["Ticker"] = ""
+    if "ISIN" not in df.columns:
+        df["ISIN"] = ""
 
-    annual_cov_df = pd.DataFrame(annual_cov, index=firms["Ticker"], columns=firms["Ticker"])
-    corr_sub.index = firms["Ticker"]
-    corr_sub.columns = firms["Ticker"]
-
-    return firms.reset_index(drop=True), corr_sub, annual_cov_df
+    df["ESG Score (%)"] = df["ESG Score"] * 100
+    df = df.sort_values("Company").reset_index(drop=True)
+    return df
 
 
-# =========================================================
-# Multi-stock Markowitz helpers (firm universe)
-# =========================================================
-def invert_covariance(cov: np.ndarray) -> np.ndarray:
-    """Stable inverse for the firm-level covariance matrix."""
-    cov = np.asarray(cov, dtype=float)
-    cov = (cov + cov.T) / 2.0
-    cov = cov + np.eye(cov.shape[0]) * 1e-10
-    return np.linalg.pinv(cov)
-
-
-def frontier_constants(mu: np.ndarray, cov: np.ndarray):
-    mu = np.asarray(mu, dtype=float)
-    inv_cov = invert_covariance(cov)
-    ones = np.ones(len(mu))
-
-    A = float(ones @ inv_cov @ ones)
-    B = float(ones @ inv_cov @ mu)
-    C = float(mu @ inv_cov @ mu)
-    D = max(A * C - B**2, 1e-12)
-    return inv_cov, ones, A, B, C, D
-
-
-def gmv_weights(mu: np.ndarray, cov: np.ndarray) -> np.ndarray:
-    inv_cov, ones, A, _, _, _ = frontier_constants(mu, cov)
-    w = (inv_cov @ ones) / A
-    return w
-
-
-def target_return_weights(mu: np.ndarray, cov: np.ndarray, target_return: float) -> np.ndarray:
-    inv_cov, ones, A, B, C, D = frontier_constants(mu, cov)
-    alpha = (C - B * target_return) / D
-    beta = (A * target_return - B) / D
-    w = inv_cov @ (alpha * ones + beta * mu)
-    return w
-
-
-def tangency_weights(mu: np.ndarray, cov: np.ndarray, rf: float) -> np.ndarray:
-    mu = np.asarray(mu, dtype=float)
-    inv_cov = invert_covariance(cov)
-    ones = np.ones(len(mu))
-    excess = mu - rf * ones
-    raw = inv_cov @ excess
-    denom = float(ones @ raw)
-    if abs(denom) < 1e-12:
-        return gmv_weights(mu, cov)
-    return raw / denom
-
-
-def portfolio_stats(weights: np.ndarray, mu: np.ndarray, cov: np.ndarray, esg: np.ndarray | None = None) -> dict:
-    weights = np.asarray(weights, dtype=float)
-    mu = np.asarray(mu, dtype=float)
-    cov = np.asarray(cov, dtype=float)
-
-    exp_return = float(weights @ mu)
-    variance = float(weights @ cov @ weights)
-    std_dev = float(np.sqrt(max(variance, 0.0)))
-    sharpe = np.nan if std_dev <= 1e-12 else exp_return / std_dev
-
-    out = {
-        "Expected Return": exp_return,
-        "Variance": variance,
-        "Std Dev": std_dev,
-        "Sharpe Ratio (rf=0)": sharpe,
-    }
-    if esg is not None:
-        out["ESG Score"] = float(weights @ esg)
-    return out
-
-
-def build_analytic_frontier(
-    mu: np.ndarray,
-    cov: np.ndarray,
-    esg: np.ndarray,
-    rf: float,
-    num_points: int = 80,
-) -> tuple[pd.DataFrame, dict, dict]:
+def recommend_firm_pair_for_esg_mvp(
+    company_df: pd.DataFrame,
+    portfolio_weights: tuple[float, float],
+    target_asset_esg: tuple[float, float],
+    target_portfolio_esg: float,
+    min_company_esg: float,
+) -> tuple[pd.Series | None, pd.DataFrame]:
     """
-    Build the classic unconstrained Markowitz frontier.
-    This is used for the firm universe because it is fast and scales well.
+    Recommend two firms from the ESG dataset for the ESG minimum-variance portfolio.
+
+    Since the file only contains ESG scores, this is NOT a true firm-level MVP.
+    Instead, it selects two firms that:
+    - pass the company ESG threshold
+    - best match the portfolio ESG target and the entered asset ESG profile
+    - use the model's ESG-MVP weights
     """
-    mu = np.asarray(mu, dtype=float)
-    esg = np.asarray(esg, dtype=float)
-    cov = np.asarray(cov, dtype=float)
+    eligible = company_df[company_df["ESG Score"] >= min_company_esg].copy()
 
-    w_gmv = gmv_weights(mu, cov)
-    gmv = portfolio_stats(w_gmv, mu, cov, esg)
-    gmv["Weights"] = w_gmv
+    if len(eligible) < 2:
+        return None, eligible
 
-    w_tan = tangency_weights(mu, cov, rf)
-    tan = portfolio_stats(w_tan, mu - rf, cov, esg)
-    tan["Expected Return"] = float(w_tan @ mu)
-    tan["Std Dev"] = float(np.sqrt(max(float(w_tan @ cov @ w_tan), 0.0)))
-    tan["Sharpe Ratio"] = np.nan if tan["Std Dev"] <= 1e-12 else (tan["Expected Return"] - rf) / tan["Std Dev"]
-    tan["Weights"] = w_tan
-
-    target_min = float(min(mu.min(), gmv["Expected Return"]))
-    target_max = float(max(mu.max(), tan["Expected Return"], gmv["Expected Return"]))
-    if np.isclose(target_min, target_max):
-        target_max = target_min + 1e-6
-
-    target_returns = np.linspace(target_min, target_max, num_points)
+    w1, w2 = portfolio_weights
+    target1, target2 = target_asset_esg
 
     rows = []
-    for target in target_returns:
-        w = target_return_weights(mu, cov, target)
-        stats = portfolio_stats(w, mu, cov, esg)
-        rows.append({
-            "Target Return": target,
-            "Expected Return": stats["Expected Return"],
-            "Std Dev": stats["Std Dev"],
-            "Variance": stats["Variance"],
-            "ESG Score": stats["ESG Score"],
-        })
+    for i, firm1 in eligible.iterrows():
+        for j, firm2 in eligible.iterrows():
+            if i == j:
+                continue
 
-    frontier_df = pd.DataFrame(rows)
-    frontier_df = frontier_df.sort_values("Std Dev").reset_index(drop=True)
-    frontier_df["Efficient"] = frontier_df["Expected Return"] >= gmv["Expected Return"] - 1e-12
+            pair_portfolio_esg = w1 * firm1["ESG Score"] + w2 * firm2["ESG Score"]
 
-    return frontier_df, gmv, tan
+            # Lower objective is better
+            objective = (
+                3.0 * abs(pair_portfolio_esg - target_portfolio_esg)
+                + 1.0 * abs(firm1["ESG Score"] - target1)
+                + 1.0 * abs(firm2["ESG Score"] - target2)
+            )
+
+            rows.append({
+                "Firm 1": firm1["Company"],
+                "Firm 1 Ticker": firm1.get("Ticker", ""),
+                "Firm 1 ISIN": firm1.get("ISIN", ""),
+                "Firm 1 ESG Grade": firm1["ESG Grade"],
+                "Firm 1 ESG Score": firm1["ESG Score"],
+                "Firm 1 Weight": w1,
+                "Firm 2": firm2["Company"],
+                "Firm 2 Ticker": firm2.get("Ticker", ""),
+                "Firm 2 ISIN": firm2.get("ISIN", ""),
+                "Firm 2 ESG Grade": firm2["ESG Grade"],
+                "Firm 2 ESG Score": firm2["ESG Score"],
+                "Firm 2 Weight": w2,
+                "Implied Portfolio ESG": pair_portfolio_esg,
+                "Target Portfolio ESG": target_portfolio_esg,
+                "Match Objective": objective,
+            })
+
+    pair_df = pd.DataFrame(rows).sort_values("Match Objective").reset_index(drop=True)
+    best_pair = pair_df.iloc[0]
+    return best_pair, eligible
 
 
-def weights_to_table(weights: np.ndarray, firms: pd.DataFrame, label: str) -> pd.DataFrame:
-    out = firms[["Ticker", "Company", "ISIN", "ESG Grade", "ESG Score", "Expected Return", "Annual Volatility"]].copy()
-    out["Weight"] = weights
-    out["Abs Weight"] = out["Weight"].abs()
-    out["Portfolio"] = label
-    out = out.sort_values("Abs Weight", ascending=False).reset_index(drop=True)
-    return out
-
-
-def firm_screen_threshold(asset1_esg_pct: float, asset2_esg_pct: float, portfolio_esg_cutoff: float) -> float:
-    """
-    Default stock-level ESG cutoff used for the real-stock universe.
-    We use the stricter of:
-      - the lower of the two input asset ESG scores
-      - the portfolio ESG cutoff implied by lambda
-    """
-    asset_floor = min(asset1_esg_pct, asset2_esg_pct) / 100.0
-    return max(asset_floor, portfolio_esg_cutoff)
-
-
-def format_weight_table(df: pd.DataFrame):
+def format_recommendation_table(df: pd.DataFrame):
     return df.style.format({
-        "ESG Score": "{:.2%}",
-        "Expected Return": "{:.2%}",
-        "Annual Volatility": "{:.2%}",
-        "Weight": "{:.2%}",
-        "Abs Weight": "{:.2%}",
+        "Firm 1 ESG Score": "{:.2%}",
+        "Firm 2 ESG Score": "{:.2%}",
+        "Firm 1 Weight": "{:.2%}",
+        "Firm 2 Weight": "{:.2%}",
+        "Implied Portfolio ESG": "{:.2%}",
+        "Target Portfolio ESG": "{:.2%}",
+        "Match Objective": "{:.4f}",
     })
 
 
@@ -455,9 +306,8 @@ if st.session_state.page == "intro":
 
         - a **standard mean-variance setup** using **all portfolios**
         - an **ESG-screened setup** using only portfolios that satisfy a **minimum portfolio ESG score**
-        - a **firm-level optimiser** using the uploaded 2024 stock dataset plus the uploaded correlation matrix
 
-        The investor utility in the 2-asset model is:
+        The investor utility is:
 
         \[
         U = E[R_p] - \frac{\gamma}{2}\sigma_p^2 + \lambda \bar{s}
@@ -471,11 +321,8 @@ if st.session_state.page == "intro":
         - \(\bar{s}\): weighted average portfolio ESG score  
         - \(\lambda\): ESG preference intensity  
 
-        In the firm-level tab, the app uses the uploaded real-stock universe and computes:
-
-        - a frontier using **all firms with complete data**
-        - a frontier using only **firms that pass the ESG screen**
-        - the **minimum-variance portfolio** for the ESG-screened firm universe
+        In the ESG graph, the feasible set is reduced by a minimum ESG requirement, which can lower the
+        tangency portfolio's Sharpe ratio and flatten the CML.
         """
     )
 
@@ -591,14 +438,6 @@ elif st.session_state.page == "inputs":
             format="%.2f",
         )
 
-        firm_frontier_points = st.slider(
-            "Number of points for firm-level frontier",
-            min_value=30,
-            max_value=200,
-            value=int(st.session_state.firm_frontier_points),
-            step=10,
-        )
-
         submitted = st.form_submit_button("Continue to results")
 
     if submitted:
@@ -613,7 +452,6 @@ elif st.session_state.page == "inputs":
         st.session_state.num_points = num_points
         st.session_state.lambda_esg = lambda_esg
         st.session_state.gamma = gamma
-        st.session_state.firm_frontier_points = firm_frontier_points
         go_to("results")
 
     if st.button("Back to introduction"):
@@ -675,14 +513,14 @@ elif st.session_state.page == "results":
 
     st.markdown(
         f"""
-        **ESG screen used in the 2-asset ESG graph**  
+        **ESG screen used in Graph 2**  
         Required portfolio ESG score = **{esg_cutoff * 100:.2f} / 100**
 
         This threshold is implied by your ESG preference \( \lambda = {lambda_esg:.2f} \).
         """
     )
 
-    tab_analysis, tab_firm = st.tabs(["Portfolio analysis", "Firm-level frontier & ESG MVP"])
+    tab_analysis, tab_reco = st.tabs(["Portfolio analysis", "Firm recommendation"])
 
     with tab_analysis:
         # -----------------------------------------------------
@@ -884,265 +722,129 @@ elif st.session_state.page == "results":
             mime="text/csv"
         )
 
-    with tab_firm:
-        st.subheader("3) Real-stock frontier and ESG minimum-variance portfolio")
+    with tab_reco:
+        st.subheader("Firm recommendation for the ESG minimum-variance portfolio")
 
         st.markdown(
             """
-            This tab uses the uploaded stock universe and calculates a **true firm-level** mean-variance setup.
+            This tab maps your **ESG minimum-variance portfolio** onto **2 firms** from
+            `esg_data_2025_esgcombined_only.csv`.
 
-            It compares:
-            - a frontier built from **all firms with complete data**
-            - a frontier built only from firms that pass the **minimum company ESG score**
-            - the **minimum-variance portfolio** from the ESG-screened firm universe
+            The selected firms:
+            - come from the 2025 ESG dataset
+            - satisfy a minimum company ESG score
+            - best match the ESG profile of your ESG-screened minimum-variance portfolio
 
-            **Important note:** to keep units consistent with the 2024 annual returns,
-            the optimiser combines the uploaded **correlation matrix** with the uploaded
-            **2024 annualised volatilities** to build the covariance matrix used here.
-
-            The firm-level frontier below is the classic **unconstrained Markowitz frontier**.
+            **Note:** this is an ESG-only matching step.  
+            The dataset does not contain firm-level returns, volatilities, or correlations,
+            so this is not a true firm-level minimum-variance optimisation.
             """
         )
 
         try:
-            firms, corr_sub, annual_cov_df = load_firm_universe_data()
+            company_df = load_company_esg_data()
 
-            default_company_cutoff = firm_screen_threshold(
-                asset1_esg_pct=st.session_state.esg1,
-                asset2_esg_pct=st.session_state.esg2,
-                portfolio_esg_cutoff=esg_cutoff,
+            min_company_esg_pct = st.number_input(
+                "Minimum company ESG score for recommendation (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(esg_cutoff * 100),
+                step=1.0,
+                format="%.1f",
+                key="min_company_esg_pct_reco"
             )
 
-            st.write(f"Usable firms with complete information: **{len(firms)}**")
-            st.write(
-                f"Default company ESG cutoff (based on your asset ESG inputs and the portfolio ESG screen): "
-                f"**{default_company_cutoff * 100:.2f} / 100**"
+            best_pair, eligible_companies = recommend_firm_pair_for_esg_mvp(
+                company_df=company_df,
+                portfolio_weights=(float(mvp_esg["Weight Asset 1"]), float(mvp_esg["Weight Asset 2"])),
+                target_asset_esg=(st.session_state.esg1 / 100.0, st.session_state.esg2 / 100.0),
+                target_portfolio_esg=float(mvp_esg["ESG Score"]),
+                min_company_esg=min_company_esg_pct / 100.0,
             )
 
-            col_a, col_b = st.columns(2)
-            with col_a:
-                min_company_esg_pct = st.number_input(
-                    "Minimum company ESG score for firm frontier (%)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(default_company_cutoff * 100),
-                    step=1.0,
-                    format="%.1f",
-                    key="min_company_esg_pct_firm_frontier"
-                )
-            with col_b:
-                firm_frontier_points = st.slider(
-                    "Points used for firm frontier graph",
-                    min_value=30,
-                    max_value=200,
-                    value=int(st.session_state.firm_frontier_points),
-                    step=10,
-                    key="firm_frontier_points_results"
-                )
+            st.write(f"Companies available in 2025 ESG file: **{len(company_df)}**")
+            st.write(f"Companies meeting the company ESG cutoff: **{len(eligible_companies)}**")
 
-            # All-stock universe
-            firms_all = firms.copy()
-            mu_all = firms_all["Expected Return"].to_numpy(dtype=float)
-            esg_all = firms_all["ESG Score"].to_numpy(dtype=float)
-            cov_all = annual_cov_df.loc[firms_all["Ticker"], firms_all["Ticker"]].to_numpy(dtype=float)
-
-            frontier_all, gmv_all, tan_all = build_analytic_frontier(
-                mu=mu_all,
-                cov=cov_all,
-                esg=esg_all,
-                rf=rf,
-                num_points=firm_frontier_points,
-            )
-
-            # ESG-screened firm universe
-            cutoff = min_company_esg_pct / 100.0
-            firms_esg = firms_all[firms_all["ESG Score"] >= cutoff].copy().reset_index(drop=True)
-
-            st.write(f"Firms meeting the company ESG cutoff: **{len(firms_esg)}**")
-
-            if len(firms_esg) < 2:
+            if best_pair is None:
                 st.warning("Fewer than 2 firms meet the company ESG cutoff. Lower the minimum company ESG score.")
             else:
-                mu_esg_firms = firms_esg["Expected Return"].to_numpy(dtype=float)
-                esg_esg_firms = firms_esg["ESG Score"].to_numpy(dtype=float)
-                cov_esg = annual_cov_df.loc[firms_esg["Ticker"], firms_esg["Ticker"]].to_numpy(dtype=float)
+                st.subheader("Recommended 2-firm ESG minimum-variance mapping")
 
-                frontier_esg, gmv_esg_firms, tan_esg_firms = build_analytic_frontier(
-                    mu=mu_esg_firms,
-                    cov=cov_esg,
-                    esg=esg_esg_firms,
-                    rf=rf,
-                    num_points=firm_frontier_points,
-                )
-
-                # -------------------------------------------------
-                # Graph: two firm-level frontiers
-                # -------------------------------------------------
-                st.subheader("Firm-level mean-variance frontiers")
-                fig3, ax3 = plt.subplots(figsize=(11, 6))
-
-                all_eff = frontier_all[frontier_all["Efficient"]].copy()
-                esg_eff = frontier_esg[frontier_esg["Efficient"]].copy()
-
-                ax3.plot(
-                    all_eff["Std Dev"] * 100,
-                    all_eff["Expected Return"] * 100,
-                    linewidth=2.2,
-                    label="Frontier: all complete-data firms"
-                )
-                ax3.plot(
-                    esg_eff["Std Dev"] * 100,
-                    esg_eff["Expected Return"] * 100,
-                    linewidth=2.2,
-                    label="Frontier: ESG-screened firms only"
-                )
-
-                ax3.scatter(
-                    [gmv_all["Std Dev"] * 100],
-                    [gmv_all["Expected Return"] * 100],
-                    marker="o",
-                    s=100,
-                    label="GMV: all firms"
-                )
-                ax3.scatter(
-                    [gmv_esg_firms["Std Dev"] * 100],
-                    [gmv_esg_firms["Expected Return"] * 100],
-                    marker="*",
-                    s=220,
-                    label="GMV: ESG-screened firms"
-                )
-
-                ax3.annotate(
-                    "All-firm GMV",
-                    xy=(gmv_all["Std Dev"] * 100, gmv_all["Expected Return"] * 100),
-                    xytext=(8, 8),
-                    textcoords="offset points"
-                )
-                ax3.annotate(
-                    "ESG GMV",
-                    xy=(gmv_esg_firms["Std Dev"] * 100, gmv_esg_firms["Expected Return"] * 100),
-                    xytext=(8, -14),
-                    textcoords="offset points"
-                )
-
-                ax3.set_xlabel("Portfolio standard deviation (%)")
-                ax3.set_ylabel("Expected return (%)")
-                ax3.set_title("Firm-level frontiers: all firms vs ESG-screened firms")
-                ax3.grid(True)
-                ax3.legend()
-                st.pyplot(fig3)
-
-                # -------------------------------------------------
-                # Summary tables
-                # -------------------------------------------------
-                st.subheader("Firm-level portfolio summary")
-                firm_summary = pd.DataFrame([
+                reco_summary = pd.DataFrame([
                     {
-                        "Portfolio": "All-firm GMV",
-                        "Expected Return": gmv_all["Expected Return"],
-                        "Std Dev": gmv_all["Std Dev"],
-                        "ESG Score": gmv_all["ESG Score"],
-                    },
-                    {
-                        "Portfolio": "ESG-screened GMV",
-                        "Expected Return": gmv_esg_firms["Expected Return"],
-                        "Std Dev": gmv_esg_firms["Std Dev"],
-                        "ESG Score": gmv_esg_firms["ESG Score"],
-                    },
-                    {
-                        "Portfolio": "All-firm Tangency",
-                        "Expected Return": tan_all["Expected Return"],
-                        "Std Dev": tan_all["Std Dev"],
-                        "ESG Score": tan_all["ESG Score"],
-                    },
-                    {
-                        "Portfolio": "ESG-screened Tangency",
-                        "Expected Return": tan_esg_firms["Expected Return"],
-                        "Std Dev": tan_esg_firms["Std Dev"],
-                        "ESG Score": tan_esg_firms["ESG Score"],
-                    },
+                        "Firm 1": best_pair["Firm 1"],
+                        "Firm 1 Ticker": best_pair["Firm 1 Ticker"],
+                        "Firm 1 ISIN": best_pair["Firm 1 ISIN"],
+                        "Firm 1 ESG Grade": best_pair["Firm 1 ESG Grade"],
+                        "Firm 1 ESG Score": best_pair["Firm 1 ESG Score"],
+                        "Firm 1 Weight": best_pair["Firm 1 Weight"],
+                        "Firm 2": best_pair["Firm 2"],
+                        "Firm 2 Ticker": best_pair["Firm 2 Ticker"],
+                        "Firm 2 ISIN": best_pair["Firm 2 ISIN"],
+                        "Firm 2 ESG Grade": best_pair["Firm 2 ESG Grade"],
+                        "Firm 2 ESG Score": best_pair["Firm 2 ESG Score"],
+                        "Firm 2 Weight": best_pair["Firm 2 Weight"],
+                        "Implied Portfolio ESG": best_pair["Implied Portfolio ESG"],
+                        "Target Portfolio ESG": best_pair["Target Portfolio ESG"],
+                        "Match Objective": best_pair["Match Objective"],
+                    }
                 ])
 
+                st.dataframe(format_recommendation_table(reco_summary), use_container_width=True)
+
+                detail_df = pd.DataFrame([
+                    {
+                        "Portfolio being matched": "ESG Minimum Variance Portfolio",
+                        "Weight Asset 1": mvp_esg["Weight Asset 1"],
+                        "Weight Asset 2": mvp_esg["Weight Asset 2"],
+                        "Target ESG Score": mvp_esg["ESG Score"],
+                        "Utility": mvp_esg["Utility"],
+                    }
+                ])
+
+                st.subheader("Model portfolio being mapped")
                 st.dataframe(
-                    firm_summary.style.format({
-                        "Expected Return": "{:.2%}",
-                        "Std Dev": "{:.2%}",
-                        "ESG Score": "{:.2%}",
+                    detail_df.style.format({
+                        "Weight Asset 1": "{:.2%}",
+                        "Weight Asset 2": "{:.2%}",
+                        "Target ESG Score": "{:.2%}",
+                        "Utility": "{:.4f}",
                     }),
-                    use_container_width=True,
+                    use_container_width=True
                 )
 
-                # -------------------------------------------------
-                # ESG GMV weight table
-                # -------------------------------------------------
-                st.subheader("ESG-screened minimum-variance portfolio weights")
-                esg_gmv_weights = weights_to_table(
-                    weights=gmv_esg_firms["Weights"],
-                    firms=firms_esg,
-                    label="ESG-screened GMV",
-                )
+                st.subheader("Recommended firm weights")
+                weight_chart = pd.DataFrame({
+                    "Firm": [best_pair["Firm 1"], best_pair["Firm 2"]],
+                    "Weight": [best_pair["Firm 1 Weight"], best_pair["Firm 2 Weight"]],
+                })
 
+                fig3, ax3 = plt.subplots(figsize=(8, 4))
+                ax3.bar(weight_chart["Firm"], weight_chart["Weight"])
+                ax3.set_ylim(0, 1)
+                ax3.set_ylabel("Portfolio weight")
+                ax3.set_title("Recommended 2-firm weight split")
+                st.pyplot(fig3)
+
+                st.subheader("Top eligible firms by ESG score")
+                eligible_display = eligible_companies.sort_values("ESG Score", ascending=False).head(15).copy()
                 st.dataframe(
-                    format_weight_table(esg_gmv_weights.head(20)),
-                    use_container_width=True,
-                    height=500,
+                    eligible_display[["Company", "Ticker", "ISIN", "ESG Grade", "ESG Score (%)"]].style.format({
+                        "ESG Score (%)": "{:.1f}"
+                    }),
+                    use_container_width=True
                 )
 
-                st.caption(
-                    "The table shows the 20 largest absolute portfolio weights for the ESG-screened minimum-variance portfolio."
+                reco_csv = reco_summary.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download recommendation as CSV",
+                    data=reco_csv,
+                    file_name="esg_mvp_firm_recommendation.csv",
+                    mime="text/csv"
                 )
-
-                st.subheader("Top ESG-eligible firms by ESG score")
-                eligible_display = firms_esg.sort_values("ESG Score", ascending=False).copy()
-                st.dataframe(
-                    eligible_display[["Ticker", "Company", "ISIN", "ESG Grade", "ESG Score (%)", "Expected Return (%)", "Annual Volatility (%)"]].head(20),
-                    use_container_width=True,
-                )
-
-                # Downloads
-                weights_csv = esg_gmv_weights.to_csv(index=False).encode("utf-8")
-                frontier_csv = frontier_esg.to_csv(index=False).encode("utf-8")
-                eligible_csv = firms_esg.to_csv(index=False).encode("utf-8")
-
-                c1, c2, c3 = st.columns(3)
-                with c1:
-                    st.download_button(
-                        "Download ESG GMV weights CSV",
-                        data=weights_csv,
-                        file_name="esg_screened_gmv_weights.csv",
-                        mime="text/csv",
-                    )
-                with c2:
-                    st.download_button(
-                        "Download ESG frontier CSV",
-                        data=frontier_csv,
-                        file_name="esg_screened_frontier.csv",
-                        mime="text/csv",
-                    )
-                with c3:
-                    st.download_button(
-                        "Download ESG-eligible firms CSV",
-                        data=eligible_csv,
-                        file_name="esg_eligible_firms.csv",
-                        mime="text/csv",
-                    )
-
-                with st.expander("Show all ESG-screened GMV weights"):
-                    st.dataframe(format_weight_table(esg_gmv_weights), use_container_width=True, height=650)
-
-                with st.expander("Show all usable firms in the real-stock universe"):
-                    st.dataframe(
-                        firms_all[["Ticker", "Company", "ISIN", "ESG Grade", "ESG Score (%)", "Expected Return (%)", "Annual Volatility (%)"]],
-                        use_container_width=True,
-                        height=500,
-                    )
-
-                with st.expander("Show correlation matrix for ESG-eligible firms"):
-                    corr_esg = corr_sub.loc[firms_esg["Ticker"], firms_esg["Ticker"]]
-                    st.dataframe(corr_esg, use_container_width=True, height=450)
 
         except Exception as e:
-            st.error(f"Could not build the firm-level frontier from the uploaded files: {e}")
+            st.error(f"Could not load the ESG company file: {e}")
 
     col1, col2 = st.columns(2)
     with col1:
